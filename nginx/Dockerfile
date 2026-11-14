@@ -6,7 +6,10 @@ RUN mkdir -p /var/log/nginx/json
 COPY default.conf /etc/nginx/conf.d/default.conf
 COPY rotate-nginx-log.sh /usr/local/bin/rotate-nginx-log.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/rotate-nginx-log.sh /usr/local/bin/entrypoint.sh
+COPY inject-demo-lines.sh /usr/local/bin/inject-demo-lines.sh
+RUN chmod +x /usr/local/bin/rotate-nginx-log.sh \
+             /usr/local/bin/entrypoint.sh \
+             /usr/local/bin/inject-demo-lines.sh
 
 # 默认 error/access 日志仍走标准输出，不干扰 JSON 目录
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

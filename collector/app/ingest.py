@@ -15,6 +15,15 @@ Correctness model
    resumes from the last committed offset: no gaps, no duplicates.
 4. Rotated archives are never deleted or truncated; they are simply kept
    in the watched directory and drained to EOF once.
+5. Lines are split on raw bytes and decoded strictly. A line that is not
+   valid UTF-8 is a *data* problem, not something to paper over: it never
+   reaches ``/events``, it is quarantined as ``error_kind='invalid_utf8'``
+   with its exact bytes stored as a BLOB. Nothing is rewritten with ``U+FFFD``
+   at ingest time, so the original byte sequence can always be recovered
+   (Base64) together with its physical identity ``(dev, inode)``,
+   ``source_code`` and byte offset. JSON that is merely invalid/unexpected
+   keeps the historical ``invalid_json`` quarantine path. Valid lines are
+   parsed exactly as before.
 """
 
 from __future__ import annotations
@@ -27,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from . import storage
 
@@ -36,6 +45,10 @@ log = logging.getLogger("collector.ingest")
 # Read at most this many bytes per file per poll; partial tails are handled
 # on the next poll, so large files drain over successive ticks.
 READ_CHUNK = 1024 * 1024
+
+# Quarantine kinds used in ``malformed_lines.error_kind``.
+ERROR_INVALID_UTF8 = "invalid_utf8"
+ERROR_INVALID_JSON = "invalid_json"
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,17 @@ def _utc_now() -> str:
 def _source_code(path: str) -> str:
     """Stable, human-readable identifier of the source file."""
     return os.path.basename(path)
+
+
+def normalize_dirs(directory: str | Sequence[str]) -> list[str]:
+    """Accept a single directory or several watched roots.
+
+    Keeping this tiny helper means callers (and tests) can pass either form
+    without special-casing; production still watches one read-only mount.
+    """
+    if isinstance(directory, str):
+        return [directory]
+    return [d for d in directory if d]
 
 
 def list_log_files(directory: str) -> list[FileIdentity]:
@@ -98,6 +122,77 @@ def parse_line(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     return obj, None
 
 
+@dataclass(frozen=True)
+class RawLine:
+    """One complete source line, still in its physical byte form."""
+
+    offset: int            # absolute byte offset of the first byte
+    data: bytes            # exact bytes from the file (CR of CRLF stripped)
+    text: Optional[str]    # decoded text, None iff the bytes are invalid UTF-8
+    decode_error: Optional[str] = None
+
+
+def decode_line(data: bytes) -> tuple[Optional[str], Optional[str]]:
+    """Strictly decode one line. Returns ``(text, error)`` — exactly one is
+    set. No replacement characters are ever introduced here."""
+    try:
+        return data.decode("utf-8"), None
+    except UnicodeDecodeError as exc:
+        # e.g. "'utf-8' codec can't decode byte 0xff in position 10: invalid start byte"
+        return None, str(exc)
+
+
+@dataclass(frozen=True)
+class PreparedLine:
+    """Classification of one physical line before it is persisted."""
+
+    raw_bytes: bytes
+    raw_text: str                 # human-readable rendering (may be lossy)
+    parsed: Optional[dict[str, Any]]
+    error: Optional[str]
+    error_kind: Optional[str]     # None for valid lines
+
+    @property
+    def valid(self) -> bool:
+        return self.error_kind is None
+
+
+def prepare_line(line: RawLine) -> PreparedLine:
+    """Decide whether a line is an event or a quarantine candidate.
+
+    * invalid UTF-8  -> ``invalid_utf8`` (lossless bytes retained)
+    * valid UTF-8 but not a JSON object -> ``invalid_json``
+    * otherwise parsed as usual
+    """
+    if line.text is None:
+        # Lossy text is only the readable rendering; ``raw_bytes`` stays
+        # pristine and is what the API returns as Base64.
+        return PreparedLine(
+            raw_bytes=line.data,
+            raw_text=line.data.decode("utf-8", errors="replace"),
+            parsed=None,
+            error=f"invalid utf-8: {line.decode_error}",
+            error_kind=ERROR_INVALID_UTF8,
+        )
+
+    parsed, err = parse_line(line.text)
+    if err is not None:
+        return PreparedLine(
+            raw_bytes=line.data,
+            raw_text=line.text,
+            parsed=None,
+            error=err,
+            error_kind=ERROR_INVALID_JSON,
+        )
+    return PreparedLine(
+        raw_bytes=line.data,
+        raw_text=line.text,
+        parsed=parsed,
+        error=None,
+        error_kind=None,
+    )
+
+
 def _normalise(parsed: dict[str, Any], raw: str) -> dict[str, Any]:
     ts = parsed.get("time") or parsed.get("@timestamp") or parsed.get("ts")
     if not isinstance(ts, str):
@@ -133,17 +228,23 @@ def _normalise(parsed: dict[str, Any], raw: str) -> dict[str, Any]:
 
 @dataclass
 class _Drained:
-    complete_lines: list[tuple[int, str]]  # (absolute byte offset, raw line)
+    complete_lines: list[RawLine]
     next_offset: int
 
 
 def drain_file(path: str, start_offset: int, current_size: int) -> _Drained:
     """Read complete, newline-terminated lines starting at ``start_offset``.
 
+    Splitting happens on raw bytes so byte offsets stay exact and a multi-byte
+    UTF-8 sequence straddling a read chunk is never torn apart. Decoding is
+    strict: an invalid byte sequence is reported on the :class:`RawLine`
+    (``text is None``) instead of being replaced, so the caller can quarantine
+    the pristine bytes.
+
     The returned ``next_offset`` never passes the last newline, so an
     unterminated tail is revisited on the next poll.
     """
-    out: list[tuple[int, str]] = []
+    out: list[RawLine] = []
     if start_offset > current_size:
         # Truncation (not expected for the archive-style rotation, but handled):
         # the file was replaced/recreated smaller — restart from zero.
@@ -167,11 +268,13 @@ def drain_file(path: str, start_offset: int, current_size: int) -> _Drained:
             # must not be torn apart.
             *byte_parts, carry = (carry + chunk).split(b"\n")
             for piece in byte_parts:
+                start = offset
+                offset += len(piece) + 1  # +1 for the consumed '\n'
                 if piece.endswith(b"\r"):
                     piece = piece[:-1]
-                line = piece.decode("utf-8", errors="replace")
-                out.append((offset, line))
-                offset += len(piece) + 1  # +1 for the consumed '\n'
+                text, decode_error = decode_line(piece)
+                out.append(RawLine(offset=start, data=piece, text=text,
+                                   decode_error=decode_error))
         # A non-empty carry without newline: do not advance past it.
         if carry:
             # offset currently points right after the last consumed newline;
@@ -182,6 +285,85 @@ def drain_file(path: str, start_offset: int, current_size: int) -> _Drained:
         os.close(fd)
 
     return _Drained(complete_lines=out, next_offset=offset)
+
+
+def _write_state(
+    conn: sqlite3.Connection,
+    identity: FileIdentity,
+    next_offset: int,
+) -> None:
+    conn.execute(
+        """INSERT INTO ingest_state
+               (dev, inode, source_code, path, offset, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(dev, inode) DO UPDATE SET
+               source_code = excluded.source_code,
+               path        = excluded.path,
+               offset      = excluded.offset,
+               last_seen   = excluded.last_seen""",
+        (identity.dev, identity.inode, identity.source_code,
+         identity.path, next_offset, _utc_now()),
+    )
+
+
+def _persist_batch(
+    conn: sqlite3.Connection,
+    identity: FileIdentity,
+    lines: list[RawLine],
+    next_offset: int,
+) -> tuple[int, int]:
+    """Persist every complete line and the advanced offset atomically.
+
+    The whole batch is one transaction: quarantined lines, the good lines
+    that follow them and the resume offset commit together. If any INSERT
+    fails, the transaction rolls back and the next poll re-reads the exact
+    same byte range — the isolated line cannot be skipped while its
+    successors are committed, nor can rows be duplicated.
+    """
+    ingested = 0
+    malformed = 0
+    with storage.transaction(conn):
+        for line in lines:
+            prepared = prepare_line(line)
+            if not prepared.valid:
+                # Never enters /events; exact bytes retained for Base64.
+                storage.insert_malformed(
+                    conn,
+                    source_code=identity.source_code,
+                    dev=identity.dev,
+                    inode=identity.inode,
+                    byte_offset=line.offset,
+                    raw_text=prepared.raw_text,
+                    raw_bytes=prepared.raw_bytes,
+                    error=prepared.error or "unparseable line",
+                    error_kind=prepared.error_kind or ERROR_INVALID_JSON,
+                    path=identity.path,
+                )
+                malformed += 1
+                if prepared.error_kind == ERROR_INVALID_UTF8:
+                    log.warning(
+                        "quarantined invalid-utf8 line at %s byte %s "
+                        "(inode=%s, %s bytes)",
+                        identity.source_code, line.offset, identity.inode,
+                        len(prepared.raw_bytes),
+                    )
+                continue
+
+            norm = _normalise(prepared.parsed or {}, prepared.raw_text)
+            conn.execute(
+                """INSERT INTO log_events
+                       (ts, path, status, method, source_code,
+                        dev, inode, byte_offset, raw_line)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (norm["ts"], norm["path"], norm["status"], norm["method"],
+                 identity.source_code, identity.dev, identity.inode,
+                 line.offset, prepared.raw_text),
+            )
+            ingested += 1
+
+        # Offset advances in the same transaction as the rows above.
+        _write_state(conn, identity, next_offset)
+    return ingested, malformed
 
 
 def _process_file(
@@ -214,44 +396,9 @@ def _process_file(
     ingested = 0
     malformed = 0
     if drained.complete_lines or drained.next_offset != start_offset:
-        with storage.transaction(conn):
-            for abs_offset, raw in drained.complete_lines:
-                parsed, err = parse_line(raw)
-                if err is not None:
-                    conn.execute(
-                        """INSERT INTO malformed_lines
-                               (source_code, dev, inode, byte_offset, raw_line, error)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (identity.source_code, identity.dev, identity.inode,
-                         abs_offset, raw, err),
-                    )
-                    malformed += 1
-                    continue
-                norm = _normalise(parsed, raw)
-                conn.execute(
-                    """INSERT INTO log_events
-                           (ts, path, status, method, source_code,
-                            dev, inode, byte_offset, raw_line)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (norm["ts"], norm["path"], norm["status"], norm["method"],
-                     identity.source_code, identity.dev, identity.inode,
-                     abs_offset, raw),
-                )
-                ingested += 1
-
-            # Offset advances in the same transaction as the rows above.
-            conn.execute(
-                """INSERT INTO ingest_state
-                       (dev, inode, source_code, path, offset, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(dev, inode) DO UPDATE SET
-                       source_code = excluded.source_code,
-                       path        = excluded.path,
-                       offset      = excluded.offset,
-                       last_seen   = excluded.last_seen""",
-                (identity.dev, identity.inode, identity.source_code,
-                 identity.path, drained.next_offset, _utc_now()),
-            )
+        ingested, malformed = _persist_batch(
+            conn, identity, drained.complete_lines, drained.next_offset
+        )
 
     return {
         "source_code": identity.source_code,
@@ -264,10 +411,13 @@ def _process_file(
     }
 
 
-def poll_once(conn: sqlite3.Connection, directory: str) -> dict[str, Any]:
-    """One collection pass over every file currently in the directory."""
+def poll_once(conn: sqlite3.Connection, directory: str | Sequence[str]) -> dict[str, Any]:
+    """One collection pass over every file currently in the watched roots."""
     started = time.monotonic()
-    files = list_log_files(directory)
+    directories = normalize_dirs(directory)
+    files: list[FileIdentity] = []
+    for d in directories:
+        files.extend(list_log_files(d))
     per_file: list[dict[str, Any]] = []
     total_ingested = 0
     total_malformed = 0
@@ -281,6 +431,12 @@ def poll_once(conn: sqlite3.Connection, directory: str) -> dict[str, Any]:
             continue
         except OSError as exc:
             log.error("I/O error on %s: %s", identity.source_code, exc)
+            continue
+        except sqlite3.Error:
+            # The batch (quarantine rows + good rows + offset) rolled back as
+            # a unit. Keep the committed offset untouched and retry next poll.
+            log.exception("persist failed for %s; offset not advanced",
+                          identity.source_code)
             continue
         per_file.append(result)
         total_ingested += result["ingested"]
@@ -310,7 +466,7 @@ def poll_once(conn: sqlite3.Connection, directory: str) -> dict[str, Any]:
 
 
 class CollectorLoop:
-    def __init__(self, conn: sqlite3.Connection, directory: str,
+    def __init__(self, conn: sqlite3.Connection, directory: str | Sequence[str],
                  interval: float = 0.5):
         self.conn = conn
         self.directory = directory
@@ -327,7 +483,7 @@ class CollectorLoop:
 
     def run_forever(self) -> None:
         log.info("collector started on %s (interval=%ss)",
-                 self.directory, self.interval)
+                 normalize_dirs(self.directory), self.interval)
         while not self._stop:
             try:
                 with self.write_lock:
@@ -335,9 +491,10 @@ class CollectorLoop:
                 self.last_result = result
                 self.total_polls += 1
                 self.total_ingested += result["ingested"]
-                if result["ingested"]:
-                    log.info("poll #%s ingested %s line(s)",
-                             self.total_polls, result["ingested"])
+                if result["ingested"] or result["malformed"]:
+                    log.info("poll #%s ingested %s line(s), quarantined %s",
+                             self.total_polls, result["ingested"],
+                             result["malformed"])
             except Exception:
                 log.exception("poll failed; will retry")
             # Interruptible sleep so SIGTERM shuts down promptly.

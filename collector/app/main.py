@@ -8,7 +8,9 @@ POST /ingest/poll-now        force an immediate collection pass
 GET  /events                 paginated events, filter by path / status /
                              status range / source code
 GET  /events/{event_id}      single event with the raw JSON line
-GET  /malformed              quarantined lines that failed JSON parsing
+GET  /malformed              quarantined lines; invalid-UTF-8 rows carry the
+                             original bytes as Base64 plus physical identity
+GET  /malformed/{id}         single quarantined line
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from . import storage
 from .ingest import CollectorLoop, poll_once
@@ -89,6 +91,37 @@ class EventPage(BaseModel):
     items: list[Event]
 
 
+class MalformedLine(BaseModel):
+    id: int
+    source_code: str
+    dev: int
+    inode: int
+    byte_offset: int
+    # Readable rendering (U+FFFD for undecodable bytes); kept for backwards
+    # compatibility. Never use it to recover the original bytes.
+    raw_line: str
+    # Lossless original bytes, Base64 (standard alphabet, padded). For rows
+    # written before the lossless column existed this is the UTF-8 encoding of
+    # ``raw_line`` and ``raw_line_lossless`` is false.
+    raw_line_base64: str
+    raw_line_bytes_length: Optional[int]
+    raw_line_encoding: str
+    raw_line_lossless: bool
+    error: str
+    error_kind: str
+    path: Optional[str] = None
+    ingested_at: str
+
+
+class MalformedPage(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    next_offset: Optional[int]
+    by_error_kind: dict[str, int]
+    items: list[MalformedLine]
+
+
 state: dict = {}
 
 
@@ -123,9 +156,13 @@ app = FastAPI(
     title="Nginx 访问日志入仓 API",
     description=(
         "持续采集共享只读目录中的 JSON 行 Nginx 日志，按 (设备, inode) "
-        "识别文件、行与续采偏移同事务提交，支持按路径与状态码分页查询故障请求。"
+        "识别文件、行与续采偏移同事务提交，支持按路径与状态码分页查询故障请求。\n\n"
+        "**编码错误行**（非法 UTF-8 字节）绝不会出现在 `/events`：它们以 "
+        "`error_kind=invalid_utf8` 进入 `/malformed`，`raw_line_base64` 给出"
+        "原始行字节的无损 Base64，并带 `dev`/`inode`/`source_code`/"
+        "`byte_offset` 物理定位。有效行仍按原规则解析。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -157,14 +194,15 @@ def progress():
     # Current sizes from the live directory, read-only.
     current: dict[tuple[int, int], int] = {}
     try:
-        for name in os.listdir(LOG_DIR):
-            try:
-                st = os.stat(os.path.join(LOG_DIR, name))
-            except FileNotFoundError:
-                continue
-            current[(st.st_dev, st.st_ino)] = st.st_size
+        names = os.listdir(LOG_DIR)
     except FileNotFoundError:
-        pass
+        names = []
+    for name in names:
+        try:
+            st = os.stat(os.path.join(LOG_DIR, name))
+        except FileNotFoundError:
+            continue
+        current[(st.st_dev, st.st_ino)] = st.st_size
 
     files = []
     for row in rows:
@@ -231,16 +269,38 @@ def get_event(event_id: int):
     return dict(row)
 
 
-@app.get("/malformed", tags=["query"])
-def list_malformed(limit: int = Query(100, ge=1, le=1000),
-                   offset: int = Query(0, ge=0)):
-    conn = _conn()
-    total = conn.execute(
-        "SELECT COUNT(*) c FROM malformed_lines"
-    ).fetchone()["c"]
-    rows = conn.execute(
-        "SELECT * FROM malformed_lines ORDER BY id LIMIT ? OFFSET ?",
-        (limit, offset),
-    ).fetchall()
-    return {"total": total, "limit": limit, "offset": offset,
-            "items": [dict(r) for r in rows]}
+@app.get("/malformed", response_model=MalformedPage, tags=["query"])
+def list_malformed(
+    source_code: Optional[str] = Query(None, description="来源文件代号"),
+    error_kind: Optional[str] = Query(
+        None, description="错误类型：invalid_utf8 / invalid_json"),
+    dev: Optional[int] = Query(None, description="文件设备号（物理身份）"),
+    inode: Optional[int] = Query(None, description="文件 inode（物理身份）"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """坏行隔离区。编码错误行（``error_kind=invalid_utf8``）不进入
+    ``/events``，这里用 ``raw_line_base64`` 无损返回原始行字节，并附带
+    ``dev``/``inode``/``source_code``/``byte_offset`` 以便回到物理文件定位。
+
+    ``raw_line`` 仅为可读渲染（无效字节显示为 �），恢复原字节请用
+    ``raw_line_base64``。
+    """
+    return storage.query_malformed(
+        _conn(),
+        source_code=source_code,
+        error_kind=error_kind,
+        dev=dev,
+        inode=inode,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/malformed/{malformed_id}", response_model=MalformedLine,
+         tags=["query"])
+def get_malformed(malformed_id: int):
+    item = storage.get_malformed(_conn(), malformed_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="malformed line not found")
+    return item

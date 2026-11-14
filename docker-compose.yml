@@ -7,6 +7,14 @@
 # AUTO_ROTATE_INTERVAL 让 nginx 容器自动周期性轮转。
 name: nginx-log-warehouse
 
+# 一键演示“坏行后接好行”：
+#   docker compose up -d
+#   docker compose exec nginx /usr/local/bin/inject-demo-lines.sh
+#   curl -s localhost:8000/malformed | python3 -m json.tool
+#   浏览器打开 http://localhost:8000/docs
+#
+# 轮转是“可控样例”：默认手动触发（见 README），也可设置
+# AUTO_ROTATE_INTERVAL 让 nginx 容器自动周期性轮转。
 services:
   nginx:
     build: ./nginx
@@ -28,7 +36,7 @@ services:
     environment:
       DB_PATH: /data/warehouse.db
       LOG_DIR: /logs
-      POLL_INTERVAL: "0.5"
+      POLL_INTERVAL: "${POLL_INTERVAL:-0.5}"
       LOG_LEVEL: INFO
     volumes:
       # 题目要求：采集共享只读目录中的日志
@@ -36,6 +44,13 @@ services:
       - warehouse_data:/data
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     depends_on:
       nginx:
         condition: service_healthy

@@ -493,6 +493,418 @@ def test_multibyte_offsets_and_chunk_boundaries():
         shutil.rmtree(base)
 
 
+def test_invalid_utf8_quarantine():
+    print("\n[10] 非法 UTF-8：不进 /events，无损隔离并继续采集后续好行")
+    import base64
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        good1 = jline("/before", 200).encode()
+        # A log line produced from a truncated/garbled request: the URI bytes
+        # are not valid UTF-8. nginx copies them verbatim into the log.
+        bad = (b'{"time":"2026-11-13T10:00:00Z","path":"/broken/\xff\xfe'
+               b'\x80","status":500,"method":"GET"}')
+        good2 = jline("/after", 200).encode()
+        good3 = jline("/after2", 503).encode()
+        blob = good1 + bad + b"\n" + good2 + good3
+        with open(f, "wb") as fh:
+            fh.write(blob)
+
+        r = poll_once(conn, log_dir)
+        check("3 good lines ingested, 1 encoding error quarantined",
+              r["ingested"] == 3 and r["malformed"] == 1, str(r))
+
+        # --- must not appear in /events at all ---
+        n_bad = conn.execute(
+            "SELECT COUNT(*) c FROM log_events WHERE raw_line LIKE '%�%'"
+        ).fetchone()["c"]
+        check("no replacement-character row in log_events", n_bad == 0)
+        paths = [x["path"] for x in conn.execute(
+            "SELECT path FROM log_events ORDER BY id").fetchall()]
+        check("bad line absent, later good lines present",
+              paths == ["/before", "/after", "/after2"], str(paths))
+
+        m = conn.execute("SELECT * FROM malformed_lines").fetchone()
+        check("quarantined with error_kind=invalid_utf8",
+              m["error_kind"] == "invalid_utf8", str(m["error_kind"]))
+        check("quarantine records physical identity",
+              (m["dev"], m["inode"], m["source_code"]) ==
+              (os.stat(f).st_dev, os.stat(f).st_ino, "access.log"))
+        check("byte offset is the true start of the bad line",
+              m["byte_offset"] == len(good1), str(m["byte_offset"]))
+        check("exact original bytes stored losslessly",
+              bytes(m["raw_line_bytes"]) == bad,
+              repr(m["raw_line_bytes"])[:80])
+        check("lossless bytes round-trip through Base64",
+              base64.b64decode(base64.b64encode(bytes(m["raw_line_bytes"]))) == bad)
+        check("readable text column still populated (compat)",
+              m["raw_line"].startswith('{"time"') and "�" in m["raw_line"])
+
+        # --- a good line after the bad one resumes at the precise offset ---
+        rows = conn.execute(
+            "SELECT byte_offset, path FROM log_events ORDER BY id").fetchall()
+        check("good line after bad starts at bad_end + 1",
+              rows[1]["byte_offset"] == len(good1) + len(bad) + 1,
+              f"{rows[1]['byte_offset']} != {len(good1) + len(bad) + 1}")
+        st = storage.all_states(conn)[0]
+        check("resume offset equals full file size", st["offset"] == len(blob))
+
+        # --- repeat poll: no dup, no re-quarantine ---
+        r2 = poll_once(conn, log_dir)
+        check("idle poll is a no-op", r2["ingested"] == 0 and r2["malformed"] == 0)
+        check("single quarantine row for a single bad line",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM malformed_lines").fetchone()["c"] == 1)
+
+        # --- invalid UTF-8 split across a read-chunk boundary ---
+        ingest_mod = sys.modules["app.ingest"]
+        original = ingest_mod.READ_CHUNK
+        ingest_mod.READ_CHUNK = 5
+        try:
+            f2 = os.path.join(log_dir, "chunked.log")
+            bad2 = b'{"path":"/x/\xc3\x28","status":500}'  # invalid continuation
+            with open(f2, "wb") as fh:
+                fh.write(bad2 + b"\n" + jline("/ok-after-chunked", 200).encode())
+            r3 = poll_once(conn, log_dir)
+            check("chunk-split invalid line quarantined once",
+                  r3["malformed"] == 1, str(r3))
+            m2 = conn.execute(
+                "SELECT raw_line_bytes FROM malformed_lines ORDER BY id DESC"
+            ).fetchone()
+            check("chunk-split bytes preserved exactly",
+                  bytes(m2["raw_line_bytes"]) == bad2)
+        finally:
+            ingest_mod.READ_CHUNK = original
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_batch_atomicity_on_write_failure():
+    print("\n[11] 写库失败：隔离行 + 后续好行 + 续采位置整体回滚后重读")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        good1 = jline("/a", 200).encode()
+        bad = b'{"path":"/\xff","status":500}\n'
+        good2 = jline("/b", 503).encode()
+        with open(f, "wb") as fh:
+            fh.write(good1 + bad + good2)
+
+        # Force the quarantine INSERT to fail *after* the first good row of
+        # this batch was already written inside the transaction.
+        real_insert = storage.insert_malformed
+        failed = {"n": 0}
+
+        def boom(*a, **kw):
+            failed["n"] += 1
+            raise sqlite3.OperationalError("simulated write failure")
+
+        storage.insert_malformed = boom
+        try:
+            r = poll_once(conn, log_dir)
+        finally:
+            storage.insert_malformed = real_insert
+        check("failed poll reported nothing ingested", r["ingested"] == 0, str(r))
+        check("failure was actually triggered", failed["n"] == 1)
+        check("no partial rows committed",
+              conn.execute("SELECT COUNT(*) c FROM log_events").fetchone()["c"] == 0)
+        check("no quarantine row committed",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM malformed_lines").fetchone()["c"] == 0)
+        check("resume offset not advanced",
+              not storage.all_states(conn))
+
+        r = poll_once(conn, log_dir)
+        check("retry ingests both good lines and quarantines the bad one",
+              r["ingested"] == 2 and r["malformed"] == 1, str(r))
+        check("resume offset now at EOF",
+              storage.all_states(conn)[0]["offset"] == os.path.getsize(f))
+        r = poll_once(conn, log_dir)
+        check("no duplicates after retry",
+              r["ingested"] == 0 and
+              conn.execute("SELECT COUNT(*) c FROM log_events").fetchone()["c"] == 2)
+
+        # Restart (fresh connection) must not replay the batch either.
+        conn.close()
+        conn = storage.connect(db_path)
+        storage.init_db(conn)
+        r = poll_once(conn, log_dir)
+        check("restart resumes without replay",
+              r["ingested"] == 0 and r["malformed"] == 0, str(r))
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_legacy_db_compat():
+    print("\n[12] 旧库兼容：文本坏行与旧 /malformed 字段仍可查询")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        # Rebuild the pre-upgrade schema (text-only malformed_lines) and its
+        # rows, as an older deployment would have left them.
+        conn.execute("DROP TABLE malformed_lines")
+        conn.execute(
+            """CREATE TABLE malformed_lines (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   source_code TEXT NOT NULL,
+                   dev INTEGER NOT NULL,
+                   inode INTEGER NOT NULL,
+                   byte_offset INTEGER NOT NULL,
+                   raw_line TEXT NOT NULL,
+                   error TEXT NOT NULL,
+                   ingested_at TEXT NOT NULL
+                       DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))"""
+        )
+        conn.execute(
+            """INSERT INTO malformed_lines
+                   (source_code, dev, inode, byte_offset, raw_line, error)
+               VALUES ('access.log.old', 1, 42, 0, '{not json}', 'invalid json: x')"""
+        )
+        conn.execute(
+            """INSERT INTO log_events
+                   (ts, path, status, method, source_code, dev, inode,
+                    byte_offset, raw_line)
+               VALUES ('2026-11-13T10:00:00Z', '/legacy', 500, 'GET',
+                       'access.log.old', 1, 42, 0, '{"path":"/legacy"}')"""
+        )
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+
+        # Upgrade path: connect + init_db on the existing file.
+        conn = storage.connect(db_path)
+        storage.init_db(conn)
+        cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(malformed_lines)").fetchall()}
+        check("legacy columns untouched",
+              {"id", "source_code", "dev", "inode", "byte_offset",
+               "raw_line", "error", "ingested_at"} <= cols, str(cols))
+        check("lossless columns added by migration",
+              {"error_kind", "raw_line_bytes", "path"} <= cols)
+
+        old = storage.query_malformed(conn)
+        check("legacy quarantine row still returned", old["total"] == 1)
+        item = old["items"][0]
+        check("legacy row keeps its original raw_line/error/source_code",
+              item["raw_line"] == "{not json}" and item["error"] == "invalid json: x"
+              and item["source_code"] == "access.log.old", str(item))
+        check("legacy row flagged as text fallback, not lossless",
+              item["raw_line_lossless"] is False
+              and item["raw_line_encoding"] == "utf8-of-text-fallback")
+        check("legacy row base64 decodes to its text",
+              __import__("base64").b64decode(item["raw_line_base64"])
+              == b"{not json}")
+        check("legacy row grouped under invalid_json filter",
+              storage.query_malformed(conn, error_kind="invalid_json")["total"] == 1)
+        check("legacy /events row still queryable",
+              storage.query_events(conn, path="/legacy")["total"] == 1)
+
+        # New-style rows coexist with legacy ones after migration.
+        f = os.path.join(log_dir, "access.log")
+        with open(f, "wb") as fh:
+            fh.write(b'{"path":"/\xff","status":500}\n')
+        poll_once(conn, log_dir)
+        all_m = storage.query_malformed(conn, limit=1000)
+        check("legacy + new quarantine rows both listed",
+              all_m["total"] == 2 and
+              {i["error_kind"] for i in all_m["items"]} ==
+              {"invalid_json", "invalid_utf8"}, str(all_m["by_error_kind"]))
+        new = [i for i in all_m["items"] if i["error_kind"] == "invalid_utf8"][0]
+        check("new row is lossless",
+              new["raw_line_lossless"] is True and new["raw_line_bytes_length"] == 26,
+              str(new.get("raw_line_bytes_length")))
+        check("invalid_json filter still only matches the legacy row",
+              storage.query_malformed(conn, error_kind="invalid_json")["total"] == 1)
+        check("invalid_utf8 filter matches only the new row",
+              storage.query_malformed(conn, error_kind="invalid_utf8")["total"] == 1)
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_api_invalid_utf8_demo():
+    print("\n[13] API：坏行后接好行，/events 干净、/malformed 无损")
+    import base64
+    base = tempfile.mkdtemp(prefix="collector-api-utf8-")
+    log_dir = os.path.join(base, "logs")
+    db_path = os.path.join(base, "data", "warehouse.db")
+    os.makedirs(log_dir)
+    os.makedirs(os.path.dirname(db_path))
+    os.environ["DB_PATH"] = db_path
+    os.environ["LOG_DIR"] = log_dir
+    os.environ["POLL_INTERVAL"] = "0.05"
+
+    import importlib
+    from app.main import app as fresh_app
+    # other tests may have created an app against another DB; reload so the
+    # env vars above are honoured (module constants are read at import).
+    import app.main as main_mod
+    importlib.reload(main_mod)
+    fresh_app = main_mod.app
+
+    import uvicorn
+    config = uvicorn.Config(fresh_app, host="127.0.0.1", port=8766,
+                            log_level="warning")
+    server = uvicorn.Server(config)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    try:
+        for _ in range(100):
+            try:
+                urllib.request.urlopen("http://127.0.0.1:8766/health", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.1)
+
+        first = jline("/demo/before", 200)
+        bad = b'{"time":"2026-11-14T10:00:00Z","path":"/garbled/\xff\xfe","status":500,"method":"GET"}'
+        blob = (first.encode() + bad + b"\n"
+                + jline("/demo/after", 503).encode())
+        with open(os.path.join(log_dir, "access.log"), "wb") as fh:
+            fh.write(blob)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            h = json.load(urllib.request.urlopen(
+                "http://127.0.0.1:8766/health"))
+            if h["counts"]["events"] == 2 and h["counts"]["malformed"] == 1:
+                break
+            time.sleep(0.1)
+        check("health counts separate events from encoding errors",
+              h["counts"]["events"] == 2 and h["counts"]["malformed"] == 1
+              and h["counts"]["encoding_errors"] == 1, str(h["counts"]))
+
+        events = json.load(urllib.request.urlopen(
+            "http://127.0.0.1:8766/events?limit=100"))
+        check("/events contains only the good lines, in order",
+              [i["path"] for i in events["items"]] ==
+              ["/demo/before", "/demo/after"], str(events["items"]))
+
+        mal = json.load(urllib.request.urlopen(
+            "http://127.0.0.1:8766/malformed?limit=100"))
+        item = mal["items"][0]
+        check("/malformed exposes the bad line as invalid_utf8",
+              mal["total"] == 1 and item["error_kind"] == "invalid_utf8"
+              and mal["by_error_kind"] == {"invalid_utf8": 1}, str(mal["by_error_kind"]))
+        check("Base64 decodes to byte-identical original line",
+              base64.b64decode(item["raw_line_base64"]) == bad)
+        check("physical identity + offset returned",
+              item["source_code"] == "access.log"
+              and item["byte_offset"] == len(first.encode())
+              and item["inode"] == os.stat(
+                  os.path.join(log_dir, "access.log")).st_ino, str(item))
+        check("readable raw_line still available for humans",
+              item["raw_line"].startswith('{"time"') and "�" in item["raw_line"])
+
+        one = json.load(urllib.request.urlopen(
+            f"http://127.0.0.1:8766/malformed/{item['id']}"))
+        check("single malformed row endpoint", one["id"] == item["id"])
+        try:
+            urllib.request.urlopen("http://127.0.0.1:8766/malformed/999999")
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("unknown malformed id -> 404", code == 404, str(code))
+
+        prog = json.load(urllib.request.urlopen(
+            "http://127.0.0.1:8766/ingest/progress"))
+        check("progress proves the good tail was collected too",
+              prog["files"][0]["complete"] is True
+              and prog["files"][0]["offset"] == len(blob), str(prog["files"][0]))
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+        shutil.rmtree(base)
+
+
+def test_crash_resume_mixed_encoding():
+    print("\n[14] 混合好行/坏行：多次崩溃重启后严格分区、不重不漏")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        n_good = 300
+        n_bad = 30
+        expected_good, expected_bad = [], []
+        blob = b""
+        offset = 0
+        for i in range(n_good + n_bad):
+            if i % 11 == 5:  # sprinkle encoding errors through the stream
+                line = (b'{"time":"t","path":"/bad/%d/\xff","status":500}'
+                        % i)
+                expected_bad.append((offset, line))
+            else:
+                line = jline(f"/good/{i}", 200 if i % 4 else 503).encode().rstrip(b"\n")
+                expected_good.append((offset, line))
+            blob += line + b"\n"
+            offset += len(line) + 1
+        with open(f, "wb") as fh:
+            fh.write(blob)
+
+        # Repeated hard "process exits" at arbitrary points.
+        for _ in range(15):
+            c = storage.connect(db_path)
+            poll_once(c, log_dir)
+            c.close()
+        poll_once(conn, log_dir)
+
+        good_offsets = [r["byte_offset"] for r in conn.execute(
+            "SELECT byte_offset FROM log_events ORDER BY byte_offset").fetchall()]
+        bad_rows = conn.execute(
+            "SELECT byte_offset, raw_line_bytes FROM malformed_lines "
+            "ORDER BY byte_offset").fetchall()
+        bad_offsets = [r["byte_offset"] for r in bad_rows]
+
+        check(f"all {n_good} good lines stored exactly once",
+              good_offsets == [o for o, _ in expected_good],
+              f"got {len(good_offsets)}")
+        check(f"all {n_bad} encoding errors quarantined exactly once",
+              bad_offsets == [o for o, _ in expected_bad],
+              f"got {len(bad_offsets)}")
+        check("quarantined bytes byte-identical after crash/restart",
+              [bytes(r["raw_line_bytes"]) for r in bad_rows] ==
+              [b for _, b in expected_bad])
+        check("the two sets are disjoint (bad lines never in /events)",
+              not set(good_offsets) & set(bad_offsets))
+        check("resume offset exactly at EOF",
+              storage.all_states(conn)[0]["offset"] == len(blob))
+        n_events = conn.execute(
+            "SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        n_mal = conn.execute(
+            "SELECT COUNT(*) c FROM malformed_lines").fetchone()["c"]
+        check("events + malformed cover every physical line once",
+              n_events + n_mal == n_good + n_bad,
+              f"{n_events}+{n_mal}")
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_crlf_offsets_exact():
+    print("\n[15] CRLF 行：偏移按真实字节数前进，内容去除 \\r")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        l1 = jline("/crlf/1", 200).replace("\n", "\r\n")
+        l2 = jline("/crlf/2", 500).replace("\n", "\r\n")
+        with open(f, "w", newline="") as fh:
+            fh.write(l1 + l2)
+        poll_once(conn, log_dir)
+        rows = conn.execute(
+            "SELECT byte_offset, path, raw_line FROM log_events ORDER BY id"
+        ).fetchall()
+        check("CRLF offsets count the \\r byte",
+              [r["byte_offset"] for r in rows] ==
+              [0, len(l1.encode("utf-8"))],
+              str([r["byte_offset"] for r in rows]))
+        check("lines have no trailing \\r",
+              all(not r["raw_line"].endswith("\r") for r in rows))
+        check("committed offset equals file size",
+              storage.all_states(conn)[0]["offset"] == os.path.getsize(f))
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
 if __name__ == "__main__":
     test_drain_partial_tail()
     test_rotation_rename()
@@ -503,5 +915,11 @@ if __name__ == "__main__":
     test_api()
     test_offset_math_after_partial()
     test_multibyte_offsets_and_chunk_boundaries()
+    test_invalid_utf8_quarantine()
+    test_batch_atomicity_on_write_failure()
+    test_legacy_db_compat()
+    test_api_invalid_utf8_demo()
+    test_crash_resume_mixed_encoding()
+    test_crlf_offsets_exact()
     print(f"\n==== {PASS} passed, {FAIL} failed ====")
     sys.exit(1 if FAIL else 0)

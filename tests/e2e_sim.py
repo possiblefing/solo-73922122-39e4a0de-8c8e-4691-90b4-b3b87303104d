@@ -5,7 +5,10 @@
 2. writes nginx-style JSON lines, including an unterminated tail
 3. performs a rename rotation with late writes into the old inode
 4. restarts the service and proves resume without gaps/duplicates
-5. exercises every HTTP endpoint with urllib
+5. injects an invalid-UTF-8 line followed by good lines: the bad line must
+   never appear in /events, must be quarantined as invalid_utf8 and must be
+   returned losslessly (Base64) with its physical identity/offset
+6. exercises every HTTP endpoint with urllib
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import base64
 
 BASE = tempfile.mkdtemp(prefix="e2e-")
 LOG_DIR = os.path.join(BASE, "logs")
@@ -195,6 +199,70 @@ def main():
                   {"access.log", "access.log.arc1.log"}
                   and all(f["complete"] for f in prog["files"]),
                   str(prog["files"]))
+
+        print("[F] 坏行(非法 UTF-8) 后接好行：隔离无损、好行照常入仓")
+        events_before = h["counts"]["events"]
+        mal_before = h["counts"]["malformed"]
+        # Exactly what scripts/demo-malformed.sh injects in Docker: one line
+        # with raw 0xFF 0xFE bytes, then two valid lines.
+        bad = (b'{"time":"2026-11-14T10:00:00Z","remote_addr":"127.0.0.1",'
+               b'"method":"GET","uri":"/demo/broken/\xff\xfe","path":'
+               b'"/demo/broken/\xff\xfe","status":500,"bytes_sent":0,'
+               b'"request_time":0.001,"referer":"","user_agent":"demo",'
+               b'"request":"GET /demo/broken/ HTTP/1.1"}')
+        before = os.path.getsize(cur)
+        with open(cur, "ab") as fh:
+            fh.write(bad + b"\n")
+            fh.write(jline("/demo/after-bad-line", 503).encode())
+            fh.write(jline("/demo/after-bad-line", 200).encode())
+        post("/ingest/poll-now")
+
+        _, h = get("/health")
+        check("bad line is not an event; two good lines are",
+              h["counts"]["events"] == events_before + 2
+              and h["counts"]["malformed"] == mal_before + 1,
+              str(h["counts"]))
+        check("health separates encoding errors",
+              h["counts"]["encoding_errors"] >= 1, str(h["counts"]))
+
+        _, all_events = get("/events?limit=1000")
+        check("no U+FFFD event row anywhere",
+              not any("�" in (i["raw_line"] or "")
+                      for i in all_events["items"]))
+        _, after = get("/events?path=/demo/after-bad-line&limit=10")
+        check("both good lines after the bad one are queryable",
+              after["total"] == 2
+              and {i["status"] for i in after["items"]} == {503, 200},
+              str(after))
+        check("good line right after the bad one starts at bad_end + 1",
+              min(i["byte_offset"] for i in after["items"])
+              == before + len(bad) + 1,
+              f"{min(i['byte_offset'] for i in after['items'])} != "
+              f"{before + len(bad) + 1}")
+
+        _, mal = get("/malformed?error_kind=invalid_utf8&limit=10")
+        check("exactly one invalid_utf8 quarantine row",
+              mal["total"] == 1 and mal["by_error_kind"] == {"invalid_utf8": 1},
+              str(mal["by_error_kind"]))
+        item = mal["items"][0]
+        check("quarantine returns byte-identical original line",
+              base64.b64decode(item["raw_line_base64"]) == bad)
+        check("quarantine has physical identity and byte position",
+              item["source_code"] == "access.log"
+              and item["inode"] == os.stat(cur).st_ino
+              and item["byte_offset"] == before, str(item))
+        check("quarantine is flagged lossless",
+              item["raw_line_lossless"] is True
+              and item["raw_line_bytes_length"] == len(bad))
+        _, one_mal = get(f"/malformed/{item['id']}")
+        check("single malformed row matches the list entry",
+              one_mal["raw_line_base64"] == item["raw_line_base64"])
+
+        post("/ingest/poll-now")
+        _, h = get("/health")
+        check("re-poll neither duplicates nor re-quarantines",
+              h["counts"]["events"] == events_before + 2
+              and h["counts"]["malformed"] == mal_before + 1, str(h["counts"]))
     finally:
         srv2.should_exit = True
         t2.join(timeout=10)
